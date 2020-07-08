@@ -8,6 +8,7 @@ from iminuit.cost import (
     ExtendedUnbinnedNLL,
     ExtendedBinnedNLL,
     LeastSquares,
+    NormalConstraint,
 )
 
 stats = pytest.importorskip("scipy.stats")
@@ -135,3 +136,50 @@ def test_LeastSquares(loss, verbose):
     cost.mask = np.arange(len(y)) != 1
     m.migrad()
     assert_allclose(m.args, (1, 2), rtol=0.03)
+
+
+def test_addable_cost_1():
+    def model1(x, a):
+        return a + x
+
+    def model2(x, b):
+        return b + x
+
+    lsq1 = LeastSquares(1, 2, 3, model1)
+    assert lsq1.func_code.co_varnames == ["a"]
+
+    lsq2 = LeastSquares(1, 3, 4, model2)
+    assert lsq2.func_code.co_varnames == ["b"]
+
+    lsq3 = lsq1 + lsq2
+    assert lsq3.func_code.co_varnames == ["a", "b"]
+
+    assert lsq3(1, 2) == lsq1(1) + lsq2(2)
+
+    m = Minuit(lsq3, a=1, b=2)
+    m.migrad()
+    assert m.parameters == ["a", "b"]
+    assert_allclose(m.values[:], (1, 2))
+    assert_allclose(m.errors[:], (3, 4))
+    assert_allclose(m.np_covariance(), ((9, 0), (0, 16)), atol=1e-10)
+
+
+def test_addable_cost_2():
+    def model(x, a):
+        return a + x
+
+    lsq1 = LeastSquares([1], [2], [1], model)
+    lsq2 = lsq1 + NormalConstraint("a", 1, 1)
+    assert lsq1.func_code.co_varnames == ["a"]
+    assert lsq2.func_code.co_varnames == ["a"]
+
+    m = Minuit(lsq1, pedantic=False)
+    m.migrad()
+    assert_allclose(m.values[:], (1,))
+    assert_allclose(m.errors[:], (1,))
+
+    m = Minuit(lsq2, pedantic=False)
+    m.migrad()
+    assert_allclose(m.values[:], (1,))
+    assert_allclose(m.errors[:], (np.sqrt(0.5),))
+    # assert_allclose(m.np_covariance(), ((9, 0), (0, 16)), atol=1e-10)

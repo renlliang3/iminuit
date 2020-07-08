@@ -4,6 +4,7 @@ Standard cost functions to minimize.
 
 from .util import describe, make_func_code
 import numpy as np
+import copy
 
 
 def _safe_log(x):
@@ -58,16 +59,79 @@ except ImportError:
     pass
 
 
-class UnbinnedNLL:
+class Cost:
+    __slots__ = "_child", "_args", "_func_code", "_select", "verbose", "mask"
+
+    @property
+    def errordef(self):
+        return 1
+
+    @property
+    def func_code(self):
+        return self._func_code
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def __init__(self, args, verbose=0):
+        self._child = None
+        self._args = args
+        self._func_code = make_func_code(args)
+        self._select = None
+        self.verbose = verbose
+        self.mask = None
+
+    def __add__(lhs, rhs):
+        result = lhs.copy()
+        ch = rhs.copy()
+        result._back()._child = ch
+
+        # update func_code
+        args = list(result.func_code.co_varnames)
+        for arg in ch._args:
+            if arg not in args:
+                args.append(arg)
+        result._func_code = make_func_code(args)
+
+        # update selectors
+        ch = result
+        while ch is not None:
+            ch._select = [args.index(arg) for arg in ch._args]
+            ch = ch._child
+
+        return result
+
+    def __call__(self, *args):
+        r = 0.0
+        cur = self
+        while cur is not None:
+            oa = cur._our_args(args)
+            r += cur._eval(oa)
+            cur = cur._child
+        if self.verbose >= 1:
+            print(args, "->", r)
+        return r
+
+    def _our_args(self, args):
+        if self._select is None:
+            return args
+        return [args[i] for i in self._select]
+
+    def _back(self):
+        ch = self
+        while ch._child is not None:
+            ch = ch._child
+        return ch
+
+
+class UnbinnedNLL(Cost):
     """Unbinned negative log-likelihood.
 
     Use this if only the shape of the fitted PDF is of interest and the original
     unbinned data is available.
     """
 
-    mask = None
-    verbose = False
-    errordef = 0.5
+    __slots__ = "data", "pdf"
 
     def __init__(self, data, pdf, verbose=0):
         """
@@ -88,27 +152,21 @@ class UnbinnedNLL:
         """
         self.data = np.atleast_1d(data)
         self.pdf = pdf
-        self.verbose = verbose
-        self.func_code = make_func_code(describe(self.pdf)[1:])
+        Cost.__init__(self, describe(pdf)[1:], verbose)
 
-    def __call__(self, *args):
+    def _eval(self, args):
         data = self.data if self.mask is None else self.data[self.mask]
-        r = -_sum_log_x(self.pdf(data, *args))
-        if self.verbose >= 1:
-            print(args, "->", r)
-        return r
+        return -2.0 * _sum_log_x(self.pdf(data, *args))
 
 
-class ExtendedUnbinnedNLL:
+class ExtendedUnbinnedNLL(Cost):
     """Unbinned extended negative log-likelihood.
 
     Use this if shape and normalization of the fitted PDF are of interest and the
     original unbinned data is available.
     """
 
-    mask = None
-    verbose = False
-    errordef = 0.5
+    __slots__ = "data", "scaled_pdf"
 
     def __init__(self, data, scaled_pdf, verbose=0):
         """
@@ -131,27 +189,21 @@ class ExtendedUnbinnedNLL:
         """
         self.data = np.atleast_1d(data)
         self.scaled_pdf = scaled_pdf
-        self.verbose = verbose
-        self.func_code = make_func_code(describe(self.scaled_pdf)[1:])
+        Cost.__init__(self, describe(scaled_pdf)[1:], verbose)
 
-    def __call__(self, *args):
+    def _eval(self, args):
         data = self.data if self.mask is None else self.data[self.mask]
         ns, s = self.scaled_pdf(data, *args)
-        r = ns - _sum_log_x(s)
-        if self.verbose >= 1:
-            print(args, "->", r)
-        return r
+        return 2.0 * (ns - _sum_log_x(s))
 
 
-class BinnedNLL:
+class BinnedNLL(Cost):
     """Binned negative log-likelihood.
 
     Use this if only the shape of the fitted PDF is of interest and the data is binned.
     """
 
-    mask = None
-    verbose = False
-    errordef = 0.5
+    __slots__ = "n", "xe", "cdf"
 
     def __init__(self, n, xe, cdf, verbose=0):
         """
@@ -182,10 +234,9 @@ class BinnedNLL:
         self.n = n
         self.xe = xe
         self.cdf = cdf
-        self.verbose = verbose
-        self.func_code = make_func_code(describe(self.cdf)[1:])
+        Cost.__init__(self, describe(cdf)[1:], verbose)
 
-    def __call__(self, *args):
+    def _eval(self, args):
         prob = np.diff(self.cdf(self.xe, *args))
         ma = self.mask
         if ma is None:
@@ -195,22 +246,17 @@ class BinnedNLL:
             prob = prob[ma]
         mu = np.sum(n) * prob
         # + np.sum(mu) can be skipped, it is effectively constant
-        r = -_sum_n_log_mu(n, mu)
-        if self.verbose >= 1:
-            print(args, "->", r)
-        return r
+        return -2.0 * _sum_n_log_mu(n, mu)
 
 
-class ExtendedBinnedNLL:
+class ExtendedBinnedNLL(Cost):
     """Binned extended negative log-likelihood.
 
     Use this if shape and normalization of the fitted PDF are of interest and the data
     is binned.
     """
 
-    mask = None
-    verbose = False
-    errordef = 0.5
+    __slots__ = "n", "xe", "scaled_cdf"
 
     def __init__(self, n, xe, scaled_cdf, verbose=0):
         """
@@ -241,10 +287,9 @@ class ExtendedBinnedNLL:
         self.n = n
         self.xe = xe
         self.scaled_cdf = scaled_cdf
-        self.verbose = verbose
-        self.func_code = make_func_code(describe(self.scaled_cdf)[1:])
+        Cost.__init__(self, describe(scaled_cdf)[1:], verbose)
 
-    def __call__(self, *args):
+    def _eval(self, args):
         mu = np.diff(self.scaled_cdf(self.xe, *args))
         ma = self.mask
         if ma is None:
@@ -252,23 +297,16 @@ class ExtendedBinnedNLL:
         else:
             n = self.n[ma]
             mu = mu[ma]
-        r = _sum_log_poisson(n, mu)
-        if self.verbose >= 1:
-            print(args, "->", r)
-        return r
+        return 2.0 * _sum_log_poisson(n, mu)
 
 
-class LeastSquares:
+class LeastSquares(Cost):
     """Least-squares cost function (aka chisquare function).
 
     Use this if you have data of the form (x, y +/- yerror).
     """
 
-    mask = None
-    verbose = False
-    errordef = 1.0
-    _loss = None
-    _cost = None
+    __slots__ = "_loss", "_cost", "x", "y", "yerror", "model"
 
     def __init__(self, x, y, yerror, model, loss="linear", verbose=0):
         """
@@ -304,16 +342,17 @@ class LeastSquares:
             - 0: is no output (default)
             - 1: print current args and negative log-likelihood value
         """
-        x = np.atleast_1d(x)
-        y = np.atleast_1d(y)
+        x = np.atleast_1d(np.asarray(x, dtype=float))
+        y = np.atleast_1d(np.asarray(y, dtype=float))
+        yerror = np.asarray(yerror, dtype=float)
 
         if len(x) != len(y):
             raise ValueError("x and y must have same length")
 
-        if np.ndim(yerror) == 0:
+        if yerror.ndim == 0:
             yerror = yerror * np.ones_like(y)
         else:
-            if np.shape(yerror) != y.shape:
+            if yerror.shape != y.shape:
                 raise ValueError("y and yerror must have same shape")
 
         self.x = x
@@ -322,8 +361,7 @@ class LeastSquares:
 
         self.model = model
         self.loss = loss
-        self.verbose = verbose
-        self.func_code = make_func_code(describe(self.model)[1:])
+        Cost.__init__(self, describe(model)[1:], verbose)
 
     @property
     def loss(self):
@@ -341,7 +379,7 @@ class LeastSquares:
         else:
             raise ValueError("unknown loss type: " + loss)
 
-    def __call__(self, *args):
+    def _eval(self, args):
         ma = self.mask
         if ma is None:
             x = self.x
@@ -352,7 +390,20 @@ class LeastSquares:
             y = self.y[ma]
             yerror = self.yerror[ma]
         ym = self.model(x, *args)
-        r = self._cost(y, yerror, ym)
-        if self.verbose >= 1:
-            print(args, "->", r)
-        return r
+        return self._cost(y, yerror, ym)
+
+
+class NormalConstraint(Cost):
+
+    __slots__ = "_eval", "value", "error"
+
+    def __init__(self, name, value, error):
+        if isinstance(name, str):
+            args = [name]
+            self._eval = lambda args: ((args[0] - self.value) / self.error) ** 2
+        else:
+            args = name
+            self._eval = lambda args: np.sum(((args - self.value) / self.error) ** 2)
+        self.value = np.asarray(value)
+        self.error = np.asarray(error)
+        Cost.__init__(self, args, 0)
