@@ -182,4 +182,3 @@ def test_addable_cost_2():
     m.migrad()
     assert_allclose(m.values[:], (1,))
     assert_allclose(m.errors[:], (np.sqrt(0.5),))
-    # assert_allclose(m.np_covariance(), ((9, 0), (0, 16)), atol=1e-10)
