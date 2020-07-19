@@ -71,21 +71,6 @@ cdef set_parameter_state(MnUserParameterStatePtr state, object parameters, dict 
             state.Fix(i)
 
 
-cdef check_extra_args(parameters, kwd):
-    """Check keyword arguments to find unwanted/typo keyword arguments"""
-    fixed_param = set('fix_' + p for p in parameters)
-    limit_param = set('limit_' + p for p in parameters)
-    error_param = set('error_' + p for p in parameters)
-    for k in kwd.keys():
-        if k not in parameters and \
-                        k not in fixed_param and \
-                        k not in limit_param and \
-                        k not in error_param:
-            raise RuntimeError(
-                ('Cannot understand keyword %s. May be a typo?\n'
-                 'The parameters are %r') % (k, parameters))
-
-
 cdef states_equal(n, MnUserParameterStateConstPtr a, MnUserParameterStateConstPtr b):
     result = False
     for i in range(n):
@@ -118,10 +103,10 @@ cdef class BasicView:
         self._minuit = minuit
 
     def __iter__(self):
-        return self._minuit.pos2var.__iter__()
+        return self._minuit.parameters.__iter__()
 
     def __len__(self):
-        return len(self._minuit.pos2var)
+        return len(self._minuit.parameters)
 
     def keys(self):
         return [k for k in self]
@@ -136,7 +121,7 @@ cdef class BasicView:
         if isinstance(key, slice):
             ind = range(*key.indices(len(self)))
             return [self._get(i) for i in ind]
-        i = key if is_int(key) else self._minuit.var2pos[key]
+        i = key if is_int(key) else self._minuit._index(key)
         if i < 0:
             i += len(self)
         if i >= len(self):
@@ -155,7 +140,7 @@ cdef class BasicView:
                 for i in ind:
                     self._set(i, value)
             return
-        i = key if is_int(key) else self._minuit.var2pos[key]
+        i = key if is_int(key) else self._minuit._index(key)
         if i < 0:
             i += len(self)
         if i >= len(self):
@@ -178,7 +163,7 @@ cdef class ArgsView:
         self._minuit = minuit
 
     def __len__(self):
-        return len(self._minuit.pos2var)
+        return len(self._minuit.parameters)
 
     def __getitem__(self, key):
         cdef int i
@@ -257,15 +242,8 @@ cdef class Minuit:
     cdef readonly bint use_array_call
     """Boolean. Whether to pass parameters as numpy array to cost function."""
 
-    cdef readonly tuple pos2var
-    """Map variable position to name"""
-
-    cdef readonly object var2pos
-    """Map variable name to position"""
-
     # C++ object state
     cdef FCNBase*pyfcn  #:FCN
-    cdef MnApplication*minimizer  #:migrad
     cdef FunctionMinimum*cfmin  #:last migrad result
     #:initial parameter state
     cdef MnUserParameterState initial_upst
@@ -352,16 +330,11 @@ cdef class Minuit:
                  "globally for all Minuit instances",
                  mutil.IMinuitWarning)
             MnPrint.SetLevel(level)
-        if self.minimizer:
-            self.minimizer.Minimizer().Builder().SetPrintLevel(level)
 
     cdef readonly bint throw_nan
     """Boolean. Whether to raise runtime error if function evaluate to nan."""
 
     # PyMinuit compatible interface
-
-    cdef readonly object parameters
-    """Parameter name tuple"""
 
     cdef public ArgsView args
     """Parameter values in a list-like object.
@@ -405,12 +378,6 @@ cdef class Minuit:
     .. seealso:: :attr:`values`, :attr:`errors`
     """
 
-    cdef readonly object covariance
-    """Covariance matrix (dict (name1, name2) -> covariance).
-
-    .. seealso:: :meth:`matrix`
-    """
-
     cdef readonly object merrors
     """MINOS errors."""
 
@@ -419,9 +386,6 @@ cdef class Minuit:
 
     cdef readonly int ngrads
     """Number of Gradient calls of last MIGRAD / MINOS / HESSE run."""
-
-    cdef readonly object gcc
-    """Global correlation coefficients (dict : name -> gcc)."""
 
     cdef readonly object fitarg
     """Current Minuit state in form of a dict.
@@ -442,9 +406,14 @@ cdef class Minuit:
     """
 
     @property
+    def parameters(self):
+        """Parameter name tuple"""
+        return tuple(p.GetName() for p in self.initial_upst.Parameters().Parameters())
+
+    @property
     def narg(self):
         """Number of parameters."""
-        return len(self.parameters)
+        return len(self.initial_upst.Parameters().Parameters())
 
     @property
     def nfit(self):
@@ -453,6 +422,28 @@ cdef class Minuit:
         for v in self.fixed.values():
             nfit += not v
         return nfit
+
+    @property
+    def covariance(self):
+        """Covariance matrix (dict (name1, name2) -> covariance).
+
+        .. seealso:: :meth:`matrix`
+        """
+        cdef MnUserCovariance* cov = NULL
+        if self.last_upst.HasCovariance():
+            cov = &self.last_upst.Covariance()
+            return {(v1, v2): cov.get(i, j) \
+               for i, v1 in enumerate(vary_param) \
+               for j, v2 in enumerate(vary_param)}
+        return None
+
+    @property
+    def gcc(self):
+      """Global correlation coefficients (dict : name -> gcc)."""
+      if self.last_upst.HasGlobalCC() and self.last_upst.GlobalCC().IsValid():
+          return {v: self.last_upst.GlobalCC().GlobalCC()[i]
+                  for i, v in enumerate(vary_param)}
+      return None
 
     def __init__(self, fcn, grad=None, errordef=None,
                  print_level=0, name=None,
@@ -584,16 +575,9 @@ cdef class Minuit:
         if use_array_call and name is None:
             raise KeyError("`use_array_call=True` requires that `name` is set")
 
-        args = mutil.describe(fcn) if name is None \
-            else name
+        parameters = mutil.describe(fcn) if name is None else name
 
-        self.parameters = args
-        check_extra_args(args, kwds)
-
-        # Maintain 2 dictionaries to easily convert between
-        # parameter names and position
-        self.pos2var = tuple(args)
-        self.var2pos = {k: i for i, k in enumerate(args)}
+        _minuit_methods.check_extra_args(parameters, kwds)
 
         if errordef is None:
             if hasattr(fcn, 'errordef'):
@@ -608,20 +592,56 @@ cdef class Minuit:
             raise ValueError("errordef must be a positive number")
 
         if pedantic:
-            _minuit_methods.pedantic(self, args, kwds, errordef)
+            _minuit_methods.pedantic(self, parameters, kwds, errordef)
 
         if errordef is None:
             errordef = 1.0
 
-        self.fcn = fcn
-        self.grad = grad
-        self.use_array_call = use_array_call
+        self._set_fcn_and_grad(parameters, fcn, grad, errordef, use_array_call, throw_nan)
 
         self.tol = 0.1
         self.strategy = 1
         self.print_level = print_level
-        self.throw_nan = throw_nan
 
+        self.fitarg = {}
+        for x in parameters:
+            lim = mutil._normalize_limit(kwds.get('limit_' + x, None))
+            val = kwds.get(x, mutil._guess_initial_value(lim))
+            err = kwds.get('error_' + x, mutil._guess_initial_step(val))
+            fix = kwds.get('fix_' + x, False)
+            self.fitarg[unicode(x)] = val
+            self.fitarg['error_' + x] = err
+            self.fitarg['limit_' + x] = lim
+            self.fitarg['fix_' + x] = fix
+
+        set_parameter_state(&self.initial_upst, parameters, self.fitarg)
+        self.last_upst = self.initial_upst
+        self._init_args_values_errors_fixed()
+
+        self.merrors = mutil.MErrors()
+        self.cfmin = NULL
+        self.ncalls = 0
+        self.ngrads = 0
+
+    def _index(self, key):
+        return self.initial_upst.Index(key)
+
+    def _init_args_values_errors_fixed(self):
+        self.args = ArgsView(self)
+        self.args._state = &self.last_upst
+        self.values = ValueView(self)
+        self.values._state = &self.last_upst
+        self.errors = ErrorView(self)
+        self.errors._state = &self.last_upst
+        self.fixed = FixedView(self)
+        self.fixed._state = &self.last_upst
+
+    def _set_fcn_and_grad(self, fcn, grad, errordef, use_array_call, throw_nan):
+        self.fcn = fcn
+        self.grad = grad
+        self.errordef = errordef
+        self.use_array_call = use_array_call
+        self.throw_nan = throw_nan
         if self.grad is None:
             self.pyfcn = new PythonFCN(
                 self.fcn,
@@ -640,37 +660,43 @@ cdef class Minuit:
                 self.throw_nan,
             )
 
-        self.fitarg = {}
-        for x in args:
-            lim = mutil._normalize_limit(kwds.get('limit_' + x, None))
-            val = kwds.get(x, mutil._guess_initial_value(lim))
-            err = kwds.get('error_' + x, mutil._guess_initial_step(val))
-            fix = kwds.get('fix_' + x, False)
-            self.fitarg[unicode(x)] = val
-            self.fitarg['error_' + x] = err
-            self.fitarg['limit_' + x] = lim
-            self.fitarg['fix_' + x] = fix
+    def __getstate__(self):
+        return {
+          "initial_upst": self.initial_upst,
+          "last_upst": self.last_upst,
+          "cfmin": self.cfmin,
+          "merrors": self.merrors,
+          "fcn": self.fcn,
+          "grad": self.grad,
+          "errordef": self.errordef,
+          "use_array_call": self.use_array_call,
+          "throw_nan": self.throw_nan,
+          "tol": self.tol,
+          "strategy": self.strategy,
+          "print_level": self.print_level,
+          "ncalls": self.ncalls,
+          "ngrads": self.ngrads,
+        }
 
-        self.minimizer = NULL
-        self.cfmin = NULL
-        set_parameter_state(&self.initial_upst, self.parameters, self.fitarg)
-        self.last_upst = self.initial_upst
-
-        self.args = ArgsView(self)
-        self.args._state = &self.last_upst
-        self.values = ValueView(self)
-        self.values._state = &self.last_upst
-        self.errors = ErrorView(self)
-        self.errors._state = &self.last_upst
-        self.fixed = FixedView(self)
-        self.fixed._state = &self.last_upst
-        self.covariance = None
-        self.ncalls = 0
-        self.ngrads = 0
-        self.merrors = mutil.MErrors()
-        self.gcc = None
-
-
+    def __setstate__(self, state):
+        self.__dealloc__()
+        self.initial_upst = state["initial_upst"]
+        self.last_upst = state["last_upst"]
+        self._init_args_values_errors_fixed()
+        self.cfmin = state["cfmin"]
+        self.merrors = state["merrors"]
+        self._set_fcn_and_grad(
+            state["fcn"],
+            state["grad"],
+            state["errordef"],
+            state["use_array_call"],
+            state["throw_nan"]
+        )
+        self.tol = state["tol"]
+        self.strategy = state["strategy"]
+        self.print_level = state["print_level"]
+        self.ncalls = state["ncalls"]
+        self.ngrads = state["ngrads"]
 
     @classmethod
     def from_array_func(cls, fcn, start, error=None, limit=None, fix=None,
@@ -766,7 +792,7 @@ cdef class Minuit:
         return Minuit(fcn, **kwds)
 
 
-    def migrad(self, ncall=None, resume=True, int nsplit=1, precision=None):
+    def migrad(self, ncall=None, resume=True, precision=None, **deprecated_kwargs):
         """Run MIGRAD.
 
         MIGRAD is a robust minimisation algorithm which earned its reputation
@@ -777,22 +803,13 @@ cdef class Minuit:
 
             * **ncall**: integer or None, optional; (approximate)
               maximum number of call before MIGRAD will stop trying. Default: None
-              (indicates to use MIGRAD's internal heuristic). Using nsplit > 1
-              requires ncall > 0. Note: MIGRAD may slightly violate this limit,
-              because it checks the condition only after a full iteration of the
-              algorithm, which usually performs several function calls.
+              (indicates to use MIGRAD's internal heuristic). Note: MIGRAD may slightly
+              violate this limit, because it checks the condition only after a full
+              iteration of the algorithm, which usually performs several function calls.
 
             * **resume**: boolean indicating whether MIGRAD should resume from
               the previous minimiser attempt(True) or should start from the
               beginning(False). Default True.
-
-            * **nsplit**: split MIGRAD in to *split* runs. Max fcn call
-              for each run is ncall/nsplit. MIGRAD stops when it found the
-              function minimum to be valid or ncall is reached. This is useful
-              for getting progress. However, you need to make sure that
-              ncall/nsplit is large enough. Otherwise, MIGRAD will think
-              that the minimum is invalid due to exceeding max call
-              (ncall/nsplit). Default 1(no split).
 
             * **precision**: override miniut own's internal precision.
 
@@ -803,64 +820,55 @@ cdef class Minuit:
         if ncall is None:
             ncall = 0 # tells C++ Minuit to use its internal heuristic
 
-        if nsplit > 1 and ncall == 0:
-            raise ValueError("ncall > 0 is required for nsplit > 1")
+        if "nsplit" in deprecated_kwargs:
+            warn("`nsplit` keyword has been deprecated without replacement",
+                 DeprecationWarning,
+                 stacklevel=2);
+            del deprecated_kwargs["nsplit"]
+
+        if deprecated_kwargs:
+            raise KeyError("keyword(s) not recognized: " + " ".join(deprecated_kwargs))
 
         #construct new fcn and migrad if
         #it's a clean state or resume=False
-        cdef MnStrategy*strat = NULL
+        cdef MnStrategy* strat = NULL
+        cdef PythonGradientFCNPtr grad_ptr = NULL
 
         if not resume:
             self.last_upst = self.initial_upst
-
-        if self.minimizer is not NULL:
-            del self.minimizer
-            self.minimizer = NULL
-        strat = new MnStrategy(self.strategy)
-
-        if self.grad is None:
-            self.minimizer = new MnMigrad(
-                deref(<FCNBase*> self.pyfcn),
-                self.last_upst, deref(strat)
-            )
-        else:
-            self.minimizer = new MnMigrad(
-                deref(<FCNGradientBase*> self.pyfcn),
-                self.last_upst, deref(strat)
-            )
-
-        del strat
-        strat = NULL
-
-        self.minimizer.Minimizer().Builder().SetPrintLevel(self.print_level)
-        if precision is not None:
-            self.minimizer.SetPrecision(precision)
-
-        cdef PythonGradientFCNPtr grad_ptr = NULL
-        if not resume:
+            del self.cfmin
             dynamic_cast[IMinuitMixinPtr](self.pyfcn).resetNumCall()
             grad_ptr = dynamic_cast[PythonGradientFCNPtr](self.pyfcn)
             if grad_ptr:
                 grad_ptr.resetNumGrad()
 
-        #this returns a real object need to copy
-        ncall_round = round(1.0 * ncall / nsplit)
-        assert (nsplit == 1 or ncall_round > 0)
+        strat = new MnStrategy(self.strategy)
 
-        def total_calls():
-            return self.ncalls_total - self.ncalls
+        cdef MnApplication *minimizer = NULL
+
+        if self.grad is None:
+            minimizer = new MnMigrad(
+                deref(<FCNBase*> self.pyfcn),
+                self.last_upst, deref(strat)
+            )
+        else:
+            minimizer = new MnMigrad(
+                deref(<FCNGradientBase*> self.pyfcn),
+                self.last_upst, deref(strat)
+            )
+
+        del strat
+
+        minimizer.Minimizer().Builder().SetPrintLevel(self.print_level)
+        if precision is not None:
+            minimizer.SetPrecision(precision)
 
         self.ncalls = self.ncalls_total
         self.ngrads = self.ngrads_total
 
-        while total_calls() == 0 or (not self.cfmin.IsValid() and total_calls() < ncall):
-            if self.cfmin:  # delete existing
-                del self.cfmin
-            self.cfmin = call_mnapplication_wrapper(
-                deref(self.minimizer), ncall_round, self.tol)
-            self.last_upst = self.cfmin.UserState()
-            if self.print_level > 1 and nsplit != 1:
-                print(self.fmin)
+        self.cfmin = call_mnapplication_wrapper(deref(minimizer), ncall, self.tol)
+
+        del minimizer
 
         self.last_upst = self.cfmin.UserState()
         self.refresh_internal_state()
@@ -913,7 +921,7 @@ cdef class Minuit:
         cdef MnHesse* hesse = new MnHesse(self.strategy)
 
         if self.cfmin:
-            if states_equal(len(self.parameters), &self.last_upst, &self.cfmin.UserState()):
+            if states_equal(self.narg, &self.last_upst, &self.cfmin.UserState()):
                 # last_upst has been modified, cannot just update last cfmin
                 self.last_upst = hesse.call(
                     deref(<FCNBase*> self.pyfcn),
@@ -1032,7 +1040,7 @@ cdef class Minuit:
                          mutil.IMinuitWarning)
                     return None
                 continue
-            mnerror = minos.Minos(self.var2pos[vname], ncall_c)
+            mnerror = minos.Minos(self._index(vname), ncall_c)
             self.merrors[vname] = minoserror2struct(vname, mnerror)
 
         self.refresh_internal_state()
@@ -1124,7 +1132,7 @@ cdef class Minuit:
 
             ``numpy.ndarray`` of shape (N,).
         """
-        a = np.empty(len(self.parameters), dtype=np.double)
+        a = np.empty(self.narg, dtype=np.double)
         for i, k in enumerate(self.parameters):
             a[i] = self.errors[k]
         return a
@@ -1228,14 +1236,12 @@ cdef class Minuit:
 
     def is_clean_state(self):
         """Check if minuit is in a clean state, ie. no MIGRAD call"""
-        return self.minimizer is NULL and self.cfmin is NULL
+        return self.cfmin is NULL
 
     cdef void clear_cobj(self):
         # clear C++ internal state
         del self.pyfcn
         self.pyfcn = NULL
-        del self.minimizer
-        self.minimizer = NULL
         del self.cfmin
         self.cfmin = NULL
 
@@ -1506,8 +1512,8 @@ cdef class Minuit:
         x_val = np.linspace(x_bound[0], x_bound[1], bins)
         y_val = np.linspace(y_bound[0], y_bound[1], bins)
 
-        cdef int x_pos = self.var2pos[x]
-        cdef int y_pos = self.var2pos[y]
+        cdef int x_pos = self._index(x)
+        cdef int y_pos = self._index(y)
 
         cdef list arg = list(self.args)
 
@@ -1575,8 +1581,8 @@ cdef class Minuit:
         if self.cfmin is NULL:
             raise ValueError('Run MIGRAD first')
 
-        cdef unsigned int ix = self.var2pos[x]
-        cdef unsigned int iy = self.var2pos[y]
+        cdef unsigned int ix = self._index(x)
+        cdef unsigned int iy = self._index(y)
 
         vary_param = [k for (k, v) in self.fixed.items() if not v]
 
@@ -1660,26 +1666,12 @@ cdef class Minuit:
         but kept here for PyMinuit compatibility
         """
         cdef vector[MinuitParameter] mpv
-        cdef MnUserCovariance cov
-        cdef double tmp = 0
         mpv = self.last_upst.MinuitParameters()
         self.fitarg.update({unicode(k): v for k, v in self.values.items()})
         self.fitarg.update({'error_' + k: v for k, v in self.errors.items()})
         vary_param = [k for (k, v) in self.fixed.items() if not v]
-        if self.last_upst.HasCovariance():
-            cov = self.last_upst.Covariance()
-            self.covariance = \
-                {(v1, v2): cov.get(i, j) \
-                 for i, v1 in enumerate(vary_param) \
-                 for j, v2 in enumerate(vary_param)}
-        else:
-            self.covariance = None
         self.ncalls = self.ncalls_total - self.ncalls
         self.ngrads = self.ngrads_total - self.ngrads
-        self.gcc = None
-        if self.last_upst.HasGlobalCC() and self.last_upst.GlobalCC().IsValid():
-            self.gcc = {v: self.last_upst.GlobalCC().GlobalCC()[i] for \
-                        i, v in enumerate(vary_param)}
 
     @property
     def edm(self):
@@ -1699,6 +1691,24 @@ cdef class Minuit:
              stacklevel=2,
         )
         return self.merrors
+
+    @property
+    def pos2var(self):
+        warn(
+             ":attr:`pos2var` is deprecated: Use `this_object.parameters` instead",
+             DeprecationWarning,
+             stacklevel=2,
+        )
+        return self.parameters
+
+    @property
+    def var2pos(self):
+        warn(
+             ":attr:`var2pos` is deprecated, there is no replacement",
+             DeprecationWarning,
+             stacklevel=2,
+        )
+        return {k: i for i, k in enumerate(self.parameters)}
 
     @deprecated("use `this_object.merrors` instead")
     def get_merrors(self):
