@@ -27,6 +27,7 @@ ctypedef IMinuitMixin* IMinuitMixinPtr
 ctypedef PythonGradientFCN* PythonGradientFCNPtr
 ctypedef MnUserParameterState* MnUserParameterStatePtr
 ctypedef const MnUserParameterState* MnUserParameterStateConstPtr
+ctypedef vector[MinuitParameter]* MinuitParameterVectorPtr
 
 # Helper functions
 cdef set_parameter_state(MnUserParameterStatePtr state, object parameters, dict fitarg):
@@ -69,6 +70,11 @@ cdef set_parameter_state(MnUserParameterStatePtr state, object parameters, dict 
 
         if fitarg['fix_' + pname]:
             state.Fix(i)
+
+
+cdef get_params(vector[MinuitParameter] mps, merrors):
+    return mutil.Params((minuitparam2struct(mps[i]) for i in range(mps.size())),
+                        merrors)
 
 
 cdef states_equal(n, MnUserParameterStateConstPtr a, MnUserParameterStateConstPtr b):
@@ -408,12 +414,14 @@ cdef class Minuit:
     @property
     def parameters(self):
         """Parameter name tuple"""
-        return tuple(p.GetName() for p in self.initial_upst.Parameters().Parameters())
+        cdef vector[MinuitParameter] mps
+        mps = self.last_upst.MinuitParameters()
+        return tuple(mps[i].Name() for i in range(mps.size))
 
     @property
     def narg(self):
         """Number of parameters."""
-        return len(self.initial_upst.Parameters().Parameters())
+        return self.last_upst.MinuitParameters().size()
 
     @property
     def nfit(self):
@@ -429,6 +437,11 @@ cdef class Minuit:
 
         .. seealso:: :meth:`matrix`
         """
+        vary_param = []
+        for name in self.parameters:
+            if not self.fixed[name]:
+              vary_param.append(name)
+
         cdef MnUserCovariance* cov = NULL
         if self.last_upst.HasCovariance():
             cov = &self.last_upst.Covariance()
@@ -440,6 +453,11 @@ cdef class Minuit:
     @property
     def gcc(self):
       """Global correlation coefficients (dict : name -> gcc)."""
+      vary_param = []
+      for name in self.parameters:
+          if not self.fixed[name]:
+            vary_param.append(name)
+
       if self.last_upst.HasGlobalCC() and self.last_upst.GlobalCC().IsValid():
           return {v: self.last_upst.GlobalCC().GlobalCC()[i]
                   for i, v in enumerate(vary_param)}
@@ -662,9 +680,9 @@ cdef class Minuit:
 
     def __getstate__(self):
         return {
-          "initial_upst": self.initial_upst,
-          "last_upst": self.last_upst,
-          "cfmin": self.cfmin,
+          # "initial_upst": self.initial_upst,
+          # "last_upst": self.last_upst,
+          # "cfmin": self.cfmin,
           "merrors": self.merrors,
           "fcn": self.fcn,
           "grad": self.grad,
@@ -683,7 +701,7 @@ cdef class Minuit:
         self.initial_upst = state["initial_upst"]
         self.last_upst = state["last_upst"]
         self._init_args_values_errors_fixed()
-        self.cfmin = state["cfmin"]
+        # self.cfmin = state["cfmin"]
         self.merrors = state["merrors"]
         self._set_fcn_and_grad(
             state["fcn"],
@@ -1056,15 +1074,14 @@ cdef class Minuit:
                 "Covariance is not valid. May be the last Hesse call failed?")
 
         cdef MnUserCovariance mncov = self.last_upst.Covariance()
-        cdef vector[MinuitParameter] mp = self.last_upst.MinuitParameters()
 
         # When some parameters are fixed, mncov is a sub-matrix. If skip-fixed
         # is false, we need to expand the sub-matrix back into the full form.
         # This requires a translation between sub-index und full-index.
         if skip_fixed:
             npar = 0
-            for i in range(mp.size()):
-                if not mp[i].IsFixed():
+            for i in range(self.narg):
+                if not self.fixed[i]:
                     npar += 1
             ind = range(npar)
             def cov(i, j):
@@ -1072,11 +1089,11 @@ cdef class Minuit:
         else:
             ext2int = {}
             iint = 0
-            for i in range(mp.size()):
-                if not mp[i].IsFixed():
+            for i in range(self.narg):
+                if not self.fixed[i]:
                     ext2int[i] = iint
                     iint += 1
-            ind = range(mp.size())
+            ind = range(self.narg)
             def cov(i, j):
                 if i not in ext2int or j not in ext2int:
                     return 0.0
@@ -1153,7 +1170,7 @@ cdef class Minuit:
             ``numpy.ndarray`` of shape (2, N).
         """
         # array format follows matplotlib conventions, see pyplot.errorbar
-        a = np.empty((2, len(self.parameters)), dtype=np.double)
+        a = np.empty((2, self.narg), dtype=np.double)
         for i, k in enumerate(self.parameters):
             me = self.merrors[k]
             a[0, i] = -me.lower
@@ -1199,16 +1216,12 @@ cdef class Minuit:
     @property
     def params(self):
         """List of current parameter data objects"""
-        cdef vector[MinuitParameter] vmps = self.last_upst.MinuitParameters()
-        return mutil.Params((minuitparam2struct(vmps[i]) for i in range(vmps.size())),
-                            self.merrors)
+        return get_params(self.last_upst.MinuitParameters(), self.merrors)
 
     @property
     def init_params(self):
         """List of current parameter data objects set to the initial fit state"""
-        cdef vector[MinuitParameter] vmps = self.initial_upst.MinuitParameters()
-        return mutil.Params((minuitparam2struct(vmps[i]) for i in range(vmps.size())),
-                            None)
+        return get_params(self.initial_upst.MinuitParameters(), None)
 
     @property
     def ncalls_total(self):
